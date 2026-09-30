@@ -2,282 +2,71 @@
 name: wechat-channels-history-review
 metadata:
   version: "0.1.0"
-description: 批量分析视频号带货者历史所有有效场次的直播数据。从直播历史页提取场次列表（包含 objectId），过滤有效场次（看播人数≥100且GMV大于0），逐场进入 dashboardV4 提取概览指标 + 分钟趋势 + 趋势分析，最后汇总跨场复盘。依赖 Kimi WebBridge + Chrome 已登录 channels.weixin.qq.com。触发词：分析带货者最近/历史所有场次、批量复盘、近7/30/所有场、每个有效场次、批量场次、跨场对比、所有直播场次。
+description: 从已登录视频号后台采集指定范围的历史直播场次，批量读取概览与分钟趋势，生成跨场复盘。适用于近N场、近N天或全部可访问历史的对比；依赖 Kimi WebBridge，默认不扩展到全部历史。
 ---
 
 # 视频号历史直播批量复盘
 
-用于从 `channels.weixin.qq.com/platform/statistic/live?mode=history` 批量提取多场直播数据，逐场深扒 dashboardV4，输出跨场对比复盘。复用 `wechat-channels-data-reader` 的分钟趋势和趋势分析脚本。
+比较指定带货者的多场直播，找出货盘、流量承接与公司收益的差异。输出实际覆盖范围和失败清单，不能把可访问样本说成完整账号历史。
 
-**北极星：公司侧月度毛利润。不只看 GMV。**
+## 输入与准备
 
----
+- 确认当前账号、带货者和范围；“近 N 场”与“近 N 天”分别处理。没有范围时先读取历史第 1 页；要求当前页时只读当前页，不擅自切回第 1 页。
+- Chrome 已登录 `channels.weixin.qq.com`；Kimi WebBridge daemon 与扩展连接正常；Node.js 18+、Python 3.10+ 可用。
+- 批量趋势分析固定查找 `~/.agents/skills/wechat-channels-data-reader/scripts/analyze_live_trend_minutes.py`，当前不支持用 `DATA_READER_DIR` 环境变量覆盖。缺依赖时说明不能生成自动趋势分析；概览采集仍可独立使用。
+- 实施前读 [页面结构与脚本限制](references/history-page-structure.md)，尤其是金额单位、缺失值与断点汇总限制。
 
-## 快速流程
-
-### Step 1: 提取场次列表
-
-默认只提取当前历史页，适合先看近一页数据：
-
-```bash
-SKILL_DIR="${SKILL_DIR:-$HOME/.agents/skills/wechat-channels-history-review}"
-node "$SKILL_DIR/scripts/extract_history_sessions.mjs" \
-  --session wch-history-extract \
-  --out /tmp/history_sessions.json \
-  --wait-ms 12000
-```
-
-如果用户明确要求“所有场次 / 全部历史页”，优先用 store 全量提取：
+## 1. 采集并核对场次列表
 
 ```bash
 SKILL_DIR="${SKILL_DIR:-$HOME/.agents/skills/wechat-channels-history-review}"
 node "$SKILL_DIR/scripts/extract_livehistory_store.mjs" \
-  --out /tmp/history_sessions_all.json \
-  --wait-ms 8000
+  --pages 1 --out ./history_sessions.json --wait-ms 8000
 ```
 
-如果 store 不可用，再用 UI 翻页兜底：
+该命令新开历史页并读取第 1 页。用户明确要求全部可访问历史时，去掉 `--pages 1`；需要多页但有范围时设置足够的 `--pages N`，随后筛选实际日期/场次。不要把 `N` 当成场次数。`extract_history_sessions.mjs` 旧路径曾返回 0 场，只作排查用；store 失败时按页面结构读取，必要时用 `paginate_all_pages.mjs --pages N`，先核对当前页及截止范围。
+
+输出有 `sessions`，每场含 `objectId`、标题、时长、观看、GMV、订单、详情 URL。先按 `objectId` 去重，核对账号、实际起止日期、金额单位和字段缺失。store 版 `createTime` 为 UTC 字符串，按北京时间筛日期前需转换；旧版本的 `date` 文本可能缺年份，不能猜年份。
+
+**金额不可直接信任归一化：** store 脚本按数值是否大于 1000 决定是否除以 100，这是启发式。必须对照同场 dashboard 的金额单位；不能依据金额大小判断元/分。校验前不汇总收益。
+
+## 2. 选择分析范围与深度
+
+默认筛选 `viewers >= 100 && gmv > 0`，仅是分析样本规则，不能把被排除的场次自动称为测试或无效。保留总场数、筛选后数量、排除原因；零成交场对诊断转化仍有价值。
+
+将用户范围内的场次保存为 `selected_sessions.json`（结构仍为 `{"sessions":[...]}`），先预演：
 
 ```bash
-SKILL_DIR="${SKILL_DIR:-$HOME/.agents/skills/wechat-channels-history-review}"
-node "$SKILL_DIR/scripts/paginate_all_pages.mjs" \
-  --out /tmp/history_sessions_all.json \
-  --pages 15
-```
-
-输出 JSON 示例：
-```json
-{
-  "generatedAt": "2026-06-29T12:00:00Z",
-  "sessions": [
-    {
-      "objectId": "14887277057353779322",
-      "title": "中产出国真实现状",
-      "date": "03月28日 20:42",
-      "durationSec": 11009,
-      "durationFormatted": "3小时3分钟29秒",
-      "viewers": 9966,
-      "peakOnline": 165,
-      "heat": 32,
-      "gmv": 91.6,
-      "dashboardUrl": "https://channels.weixin.qq.com/platform/statistic/dashboardV4?objetctId=14887277057353779322&entrance_id=3",
-      "source": "merged"
-    }
-  ]
-}
-```
-
-**前提条件：**
-1. Chrome 已登录 `channels.weixin.qq.com` 并在直播数据页
-2. Kimi WebBridge daemon 在跑
-3. 当前选中的带货者正确（历史页显示的是该带货者的场次）
-
-### Step 2: 过滤有效场次
-
-剔除测试/无效场次：`viewers >= 100 && gmv > 0`。命令行快速过滤：
-
-```bash
-python3 -c "import json; d=json.load(open('/tmp/history_sessions.json')); valid=[s for s in d['sessions'] if (s.get('viewers') or 0)>=100 and (s.get('gmv') or 0)>0]; print(json.dumps({'count':len(valid),'sessions':valid},indent=2))"
-```
-
-输出有效场次列表，确认哪些需要深度分析。
-
-### Step 3: 逐场深度分析（推荐用 batch_deep_dive.mjs 自动化）
-
-**推荐：一键批量处理**
-
-```bash
-SKILL_DIR="${SKILL_DIR:-$HOME/.agents/skills/wechat-channels-history-review}"
 node "$SKILL_DIR/scripts/batch_deep_dive.mjs" \
-  --sessions /tmp/history_sessions.json \
-  --out /tmp/deep-dive-results
+  --sessions ./selected_sessions.json --out ./deep-dive --dry-run
 ```
 
-`batch_deep_dive.mjs` 自动完成：
-- 过滤 valid sessions（viewers >= 100 且 GMV > 0）
-- 逐场串行：navigate → 指数退避轮询 wait store 就绪 → 提取概览（优先 store 对象，fallback innerText）→ 导出分钟趋势 → 跑趋势分析 → save → close
-- 输出 `cross_session_summary.json` 汇总全部
+核对预演名单后执行同一命令去掉 `--dry-run`。用户明确要求纳入零成交时用 `--no-gmv-filter`；要求不按观看/GMV筛选时用 `--all-sessions`，输入仍须限定为本次授权范围。
 
-选项：
-- `--skip-trends`：只抓概览，不跑分钟趋势（更快）
-- `--resume`：跳过已有输出文件的场次，支持断点续采
-- `--wait-ms 15000`：页面加载等待时间
-- `--timeout 90000`：store 轮询超时
-- `--inter-session-ms 500`：场间暂停毫秒
-- `--no-gmv-filter`：不过滤 GMV=0 的场次
-- `--dry-run`：预演，不实际执行
+| 模式/选项 | 实际行为 |
+|---|---|
+| 默认 | 逐场概览 + 分钟 CSV；至少 10 点且依赖存在时调用趋势分析 |
+| `--skip-trends` | 仅概览；分钟合计为空，跨场总 GMV/订单可能显示 0，不能当成真实 0 |
+| `--resume` | 仅按已有 CSV 跳过；不会自动汇总已跳过场次，也不验证 CSV 完整性 |
+| `--timeout 90000` | store 轮询超时，单位毫秒 |
 
-速度优化（v0.1.0）：
-- store 轮询采用指数退避（200ms 起步，最高 2s），减少空轮询
-- 概览优先读 store 对象，避免 innerText 拉取 + 正则解析
-- 场间暂停从 2s 降到 500ms
-- `--resume`：重复运行自动跳过已有结果
+脚本没有“只导趋势但不分析”的独立模式，不承诺固定每场耗时。失败场次保留原因后继续；遇登录失效、权限或限流时停止扩大采集。少于 10 个有效分钟点只报概览和缺失。
 
-**手动方案（fallback，以 curl 逐场操作）：**
+## 3. 校验、分析与交付
 
-```bash
-# 先 snapshot 看页面是否加载
-curl -s -X POST http://127.0.0.1:10086/command \
-  -H 'Content-Type: application/json' \
-  -d "{\"action\":\"snapshot\",\"args\":{},\"session\":\"$SESSION_NAME\"}"
+输出目录含每场 CSV、`live_trend_store_<objectId>_raw.json`、`live_trend_store_<objectId>_summary.json`，以及 `cross_session_summary.json`。批处理仅打印趋势分析的首行，完整报告需对相应文件手动运行依赖分析器并保存；详见参考文档的 raw 格式差异。
 
-# 如果 snapshot 有内容，提取所有文本
-python3 -c "
-import sys, json
-data = json.loads(sys.stdin.read())
-def xt(n):
-    t=[]
-    if isinstance(n,dict):
-        if n.get('role')=='StaticText' and n.get('name'): t.append(n['name'])
-        if 'children' in n:
-            for c in n['children']: t.extend(xt(c))
-    elif isinstance(n,list):
-        for i in n: t.extend(xt(i))
-    return t
-t=list(dict.fromkeys(xt(data.get('data',{}).get('tree',[]))))
-print('\n'.join(t))
-"
-```
+- 汇总前核对每场 GMV、订单、金额单位和概览。不能相加分钟 UV/买家数冒充跨分钟或跨场去重人数。
+- 缺字段与真实 0 分开。批处理会把缺渠道字段或退款率当 0；无法从源数据证实时写“未提供”，不报告真实零退款或零加热。
+- 公司侧预估收入 = 未扣退款的预估佣金 × MCN 分成 × (1−退款率)，默认 MCN 分成 40% 需注明。先核对佣金是否净额，避免重复扣退；缺退款不确认净收益。成本缺失则毛利润未计算。
+- `--resume` 后如要全量汇总，按 `objectId` 合并本次及先前已验证的逐场结果并复核数量，不能直接采用新生成的局部汇总。
 
-从文本中提取关键字段：
-- 累计成交金额 / GMV
-- 成交订单数 / 成交单量
-- 预估佣金
-- 退款率
-- 累计看播人数
-- 最高在线人数
-- 人均观看时长
-- 新增关注
-- 有效进房率
-- 直播有效进房率
-- 商品成交榜（#1 商品名 / 价格 / 店铺 / GMV贡献）
+交付保持简洁：
 
-也可用 evaluate 直接读 iframe 内文本：
-```js
-const iframe = document.querySelector('iframe[name="statistic"]');
-const doc = iframe.contentDocument;
-return doc.body.innerText;
-```
+1. 一句话结论，说明观测和待验证原因。
+2. 数据来源、采集时间、范围、筛选规则、成功/失败/缺失场次。
+3. 按场次列时长、GMV、订单、客单价、预估佣金、退款、公司侧测算及关键流量指标；未知留空并说明。
+4. 跨场模式及支持数据，回看片段和下场测试动作，分别落到带货者、运营、选品。
+5. 输出文件位置和未完成项。
 
-### Step 4: 汇总跨场复盘
-
-按以下格式输出：
-
-```text
-结论：
-【一句话总结：这些场次值不值得继续做，核心卡点是什么】
-
-数据口径：
-- 来源：直播历史页 + 逐场 dashboardV4
-- 采集时间：
-- 有效场次：X 场（过滤条件：看播 >= 100 且 GMV > 0）
-- 缺失字段：
-
-三场横向对比表：
-| 指标 | S1: 日期 标题 | S2: 日期 标题 | S3: 日期 标题 |
-|------|:---:|:---:|:---:|
-| 时长 | | | |
-| GMV | | | |
-| 订单 | | | |
-| ATV | | | |
-| 佣金率 | | | |
-| 退款率 | | | |
-| 公司收入 | | | |
-| 看播 | | | |
-| 峰值在线 | | | |
-| 商品 | | | |
-
-逐场诊断：
-1. 【场次标签】— 一句话判断
-2. ...
-
-跨场模式发现：
-1. 【佣金 / 退款 / 人群 / 成交节奏】模式
-2. ...
-
-风险：
-- ...
-
-下一步：
-1. 【选品动作】
-2. 【转化节奏动作】
-3. 【投流/人群测试】
-4. 【退款管控】
-```
-
-## 有效场次定义
-
-- 看播人数 >= 100（过滤测试/断流场次）
-- GMV > 0（只看有成交的场次）
-- 两者都满足才算有效
-
-建议先列出所有场次给用户确认，再逐个深扒。
-
-## 弹性的分析深度
-
-本 Skill 支持三种深度模式，SKILL.md 执行过程中按需选择：
-
-| 模式 | 操作 | 耗时/场 |
-|------|------|:-------:|
-| 全量 | 概览 + 分钟趋势 + 趋势分析 | 2-3min |
-| 标准 | 概览 + 分钟趋势（不跑趋势分析） | 1-1.5min |
-| 快速 | 只概览（不跑分钟趋势/趋势分析） | 20-30s |
-
-默认推荐全量。如有效场次超过 5 个，可先用标准模式跑全部，再挑 2-3 场最佳/最差跑全量。
-
-## 复用脚本路径
-
-本 Skill 依赖 `wechat-channels-data-reader` 的以下脚本：
-
-```bash
-DATA_READER_DIR="${DATA_READER_DIR:-$HOME/.agents/skills/wechat-channels-data-reader}"
-
-# 分钟趋势导出
-node "$DATA_READER_DIR/scripts/export_live_trend_minutes.mjs"
-
-# 趋势分析
-python3 "$DATA_READER_DIR/scripts/analyze_live_trend_minutes.py" [csv-path] --raw [raw-json-path]
-
-# 公司侧收入计算（可选）
-python3 "$DATA_READER_DIR/scripts/calc_channels_metrics.py" /path/to/input.json
-```
-
-脚本路径用环境变量配置，不硬编码。
-
-## 默认经营口径
-
-- 公司侧收入 = 预估佣金 × MCN 分成 × (1 - 退款率)
-- 默认 MCN 分成 40%（用户可覆盖）
-- 使用 dashboard 的「预估佣金」实际值，而非 GMV × 默认佣金率
-- 缺字段写"未提供"
-- 如提供公司成本：毛利润 = 公司侧收入 - 成本；否则写"未计算"
-
-## 失败处理
-
-- 🔴 STOP 历史页 iframe 内容为空：让用户确认已登录并在直播数据页，刷新后重试
-- 🔴 STOP `extract_history_sessions.mjs` 找不到活跃 tab：让用户打开 channels.weixin.qq.com
-- 🔴 STOP 有效场次为 0：输出全部场次列表，让用户判断哪些是有效场次
-- 🔴 STOP 某场 dashboardV4 加载失败：跳过该场，继续下一场，最后标注失败
-- 分钟点 < 10：不跑趋势分析，只出概览
-- 不编造字段、不截图 OCR 金额、不代登录
-
-## 输出要求
-
-每次执行最后追加「简版同步」：
-
-```text
-简版同步：
-- 数据源：历史页 + X 场 dashboardV4
-- 关键结果：总 GMV / 公司收入 / 有效场次数
-- 核心发现：一句话
-- 最该做的：一句话
-```
-
-## 禁止做什么
-
-- 不在用户未明确要求时自动翻页全部历史（默认只分析当前页）
-- 不代登录、不读 cookie/token
-- 不截图 OCR
-- 不编造接口、字段或商品数据
-- 不把 GMV 当公司收入
-- 不发送飞书/群消息
+只读已登录页面，不代登录、不读凭据、不截图 OCR 金额；不编造场次、接口或字段，不发送飞书/群消息。

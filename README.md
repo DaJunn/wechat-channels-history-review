@@ -1,100 +1,41 @@
 # wechat-channels-history-review
 
-**视频号历史直播批量复盘** —— 一次跑完账号历史所有有效场次，输出跨场对比。
+批量读取视频号指定范围的历史直播场次，比较概览、分钟趋势和成交表现，形成跨场复盘与下场动作。
 
-让 AI agent（DSH / Codex / Claude Code 等）使用。
+## 安装与依赖
 
-## 解决什么问题
-
-之前只能一场一场看，想知道「最近哪几场值得研究」得手动翻历史页、一场场点进数据大屏。
-
-现在能一次跑完，自动过滤掉测试场，汇总成跨场对比——哪场最好、好在哪、什么模式在重复。
-
-## 流程
-
-1. **提场次列表** —— 从历史页 runtime store 读，含 `objectId`
-2. **过滤有效场次** —— 看播人数 ≥ 100 **且** GMV > 0（剔除测试/断流场）
-3. **逐场深度分析** —— 进 dashboardV4 抓概览 + 分钟趋势 + 趋势分析
-4. **汇总跨场复盘** —— 横向对比表 + 逐场诊断 + 跨场模式发现
-
-## 前置依赖
-
-1. **kimi-webbridge daemon** 在跑：
-   ```bash
-   ~/.kimi-webbridge/bin/kimi-webbridge status
-   ```
-2. **Chrome 已登录** `channels.weixin.qq.com` 并停在直播数据页
-3. **`wechat-channels-data-reader`**（复用它的分钟趋势与趋势分析脚本）：
-   ```bash
-   git clone https://github.com/DaJunn/wechat-channels-data-reader.git \
-     ~/.agents/skills/wechat-channels-data-reader
-   ```
-4. Node.js、Python 3
-
-## 安装
+需要 Node.js 18+、Python 3.10+、连接正常的 Kimi WebBridge，以及已登录视频号后台的 Chrome。
 
 ```bash
 git clone https://github.com/DaJunn/wechat-channels-history-review.git \
   ~/.agents/skills/wechat-channels-history-review
+git clone https://github.com/DaJunn/wechat-channels-data-reader.git \
+  ~/.agents/skills/wechat-channels-data-reader
 ```
 
-## 用法
+已有目录时不要重复克隆。批量分析固定从第二个目录查找趋势分析脚本；概览采集无需该依赖。
+
+## 快速使用
+
+对 AI 说：“对比这个带货者近 7 场”“复盘近 30 天直播”“分析全部可访问历史场次”。
 
 ```bash
 SKILL_DIR="${SKILL_DIR:-$HOME/.agents/skills/wechat-channels-history-review}"
-
-# ① 提场次列表（推荐用 store 版）
 node "$SKILL_DIR/scripts/extract_livehistory_store.mjs" \
-  --out /tmp/history_sessions.json --wait-ms 8000
-
-# ② 过滤有效场次
-python3 -c "import json; d=json.load(open('/tmp/history_sessions.json')); \
-valid=[s for s in d['sessions'] if (s.get('viewers') or 0)>=100 and (s.get('gmv') or 0)>0]; \
-print(json.dumps({'count':len(valid),'sessions':valid},indent=2))"
-
-# ③ 逐场深度分析（一键批量）
+  --pages 1 --out ./history_sessions.json
 node "$SKILL_DIR/scripts/batch_deep_dive.mjs" \
-  --sessions /tmp/history_sessions.json --out /tmp/deep-dive-results
+  --sessions ./history_sessions.json --out ./deep-dive --dry-run
 ```
 
-`batch_deep_dive.mjs` 支持：
+示例只读第 1 页并预演分析名单。先核对账号、日期和金额单位，再按用户范围筛选并去掉 `--dry-run` 执行。明确要求全部历史时才去掉 `--pages 1`。
 
-| 选项 | 作用 |
-|---|---|
-| `--resume` | 跳过已有输出，**断点续采** |
-| `--skip-trends` | 只抓概览，不跑分钟趋势（更快） |
-| `--no-gmv-filter` | 不过滤 GMV=0 的场次 |
-| `--dry-run` | 预演，不实际执行 |
+## 输出与限制
 
-## 深度可选
+- 输出每场 CSV/raw/summary JSON、跨场汇总和运营复盘；实际覆盖取决于权限与页面返回。
+- 默认分析看播人数 ≥100 且 GMV>0 的场次；筛选条件不代表其他场次无效。支持 `--no-gmv-filter`、`--all-sessions` 调整样本。
+- `--skip-trends` 只读概览，脚本的分钟合计及跨场总数不可直接用；`--resume` 仅按 CSV 跳过，汇总不自动包含已跳过场次。
+- 历史金额归一化存在数值阈值猜测，须对照同场后台确认单位。缺退款/渠道数据可能被脚本显示为 0，报告时必须回查并标明缺失。
+- 公司侧预估收入需要佣金、分成和退款口径；毛利润还需公司成本。GMV 不能代表公司收益。
+- 不代登录、不读凭据、不截图 OCR 金额，不自动发群。
 
-| 模式 | 操作 | 耗时/场 |
-|---|---|---|
-| 全量 | 概览 + 分钟趋势 + 趋势分析 | 2-3 min |
-| 标准 | 概览 + 分钟趋势 | 1-1.5 min |
-| 快速 | 只概览 | 20-30 s |
-
-有效场次超过 5 个时，建议先用标准模式跑全部，再挑 2-3 场最佳/最差跑全量。
-
-## ⚠️ 已知坑
-
-- **`extract_history_sessions.mjs` 实测返回 0 场，不要用**，改用 `extract_livehistory_store.mjs`（读 runtime store，更稳）。
-- 历史接口有**订阅墙**：查询窗口 > 30 天会返回 403「仅限尊享版 Pro」。所以能拿到的场次数可能远少于账号实际场次。
-- 「近 N 场」≠「近 N 天」。窗口不够时如实说明，不要自动扩大。
-
-## 触发方式
-
-对 agent 说：「分析这个带货者最近所有场次」「批量复盘历史场次」「近 7 场每场怎么样」「跨场对比」。
-
-## 默认口径
-
-- 公司侧收入 = 预估佣金 × MCN 分成 × (1 − 退款率)
-- 默认 MCN 分成 40%
-- 不把 GMV 当公司收入，缺字段写「未提供」
-
-## 安全
-
-- 不代登录、不读 cookie / token
-- 不截图 OCR 金额
-- 不编造接口、字段或商品数据
-- 未明确要求时不自动翻页全部历史（默认只分析当前页）
+完整流程见 [SKILL.md](SKILL.md)；已知脚本限制与字段结构见 [参考说明](references/history-page-structure.md)。
