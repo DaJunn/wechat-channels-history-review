@@ -1,0 +1,4 @@
+interface:
+  display_name: "视频号历史直播批量复盘"
+  short_description: "从直播历史页批量抓取场次列表，逐场深扒 dashboardV4 数据，输出跨场复盘"
+  default_prompt: "帮我分析达人最近所有有效场次的直播数据"
